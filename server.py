@@ -1,15 +1,8 @@
 """
 Railway SOCKS5 Backend for EdgeTunnel
 ======================================
-A secure, authenticated SOCKS5 proxy server designed to run on Railway
-and be used as a fixed-IP backend for cmliu/edgetunnel Cloudflare Worker.
-
-Features:
-- Full SOCKS5 protocol with Username/Password authentication
-- Async I/O with asyncio for high concurrency
-- Built-in rate limiting per IP
-- IPv4, IPv6, and Domain name support
-- Designed for Cloudflare Workers compatibility (port 443)
+All-in-one server: SOCKS5 proxy + HTTP Health Check
+Runs as a single process on Railway.
 """
 
 import asyncio
@@ -18,7 +11,9 @@ import struct
 import logging
 import os
 import time
+import json
 from collections import defaultdict
+from aiohttp import web
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -29,15 +24,15 @@ load_dotenv()
 SOCKS_USER = os.getenv("SOCKS_USER", "")
 SOCKS_PASS = os.getenv("SOCKS_PASS", "")
 SOCKS_PORT = int(os.getenv("SOCKS_PORT", "443"))
+HEALTH_PORT = int(os.getenv("PORT", os.getenv("HEALTH_PORT", "8080")))
 
-# Rate Limiting
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "50"))
-
-# Connection timeout
 CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT", "15"))
 
-# Logging
+START_TIME = time.time()
+active_connections = 0
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s │ %(levelname)-7s │ %(message)s",
@@ -52,9 +47,7 @@ rate_limit_map: dict[str, list[float]] = defaultdict(list)
 
 
 def check_rate_limit(ip: str) -> bool:
-    """Returns True if connection is allowed, False if rate limited."""
     now = time.time()
-    # Clean old entries
     rate_limit_map[ip] = [
         t for t in rate_limit_map[ip]
         if now - t < RATE_LIMIT_WINDOW
@@ -66,35 +59,59 @@ def check_rate_limit(ip: str) -> bool:
 
 
 # ============================================================
+#  HTTP Health Check (aiohttp)
+# ============================================================
+async def health_check(request):
+    uptime = int(time.time() - START_TIME)
+    hours, remainder = divmod(uptime, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return web.json_response({
+        "status": "healthy",
+        "service": "socks5-backend",
+        "version": "1.0.0",
+        "uptime": f"{hours}h {minutes}m {seconds}s",
+        "uptime_seconds": uptime,
+        "active_socks_connections": active_connections
+    })
+
+
+async def root_handler(request):
+    return web.json_response({
+        "name": "Railway SOCKS5 Backend",
+        "version": "1.0.0",
+        "status": "running"
+    })
+
+
+def create_health_app():
+    app = web.Application()
+    app.router.add_get("/", root_handler)
+    app.router.add_get("/healthz", health_check)
+    app.router.add_get("/health", health_check)
+    return app
+
+
+# ============================================================
 #  SOCKS5 Authentication
 # ============================================================
 async def authenticate(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> bool:
-    """
-    Perform SOCKS5 Username/Password authentication (RFC 1929).
-    Returns True if authenticated successfully.
-    """
     try:
-        # --- Step 1: Method Selection ---
         header = await asyncio.wait_for(reader.readexactly(2), timeout=10)
         ver, nmethods = header[0], header[1]
 
         if ver != 0x05:
-            logger.debug(f"Invalid SOCKS version: {ver}")
             return False
 
         methods = await asyncio.wait_for(reader.readexactly(nmethods), timeout=10)
 
-        # We only accept method 0x02 (Username/Password)
         if 0x02 not in methods:
-            writer.write(b"\x05\xff")  # No acceptable methods
+            writer.write(b"\x05\xff")
             await writer.drain()
             return False
 
-        # Tell client we chose method 0x02
         writer.write(b"\x05\x02")
         await writer.drain()
 
-        # --- Step 2: Credentials ---
         auth_ver = await asyncio.wait_for(reader.readexactly(1), timeout=10)
         if auth_ver[0] != 0x01:
             return False
@@ -109,16 +126,15 @@ async def authenticate(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             "utf-8", errors="ignore"
         )
 
-        # --- Step 3: Verify ---
         if username == SOCKS_USER and password == SOCKS_PASS:
-            writer.write(b"\x01\x00")  # Success
+            writer.write(b"\x01\x00")
             await writer.drain()
             return True
         else:
-            writer.write(b"\x01\x01")  # Failure
+            writer.write(b"\x01\x01")
             await writer.drain()
             peer = writer.get_extra_info("peername")
-            logger.warning(f"Auth FAILED for user '{username}' from {peer}")
+            logger.warning(f"Auth FAILED for '{username}' from {peer}")
             return False
 
     except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionResetError):
@@ -126,10 +142,9 @@ async def authenticate(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
 
 # ============================================================
-#  Connection Handler
+#  SOCKS5 Connection Handler
 # ============================================================
 async def relay(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
-    """Relay data from src to dst until connection closes."""
     try:
         while True:
             data = await src.read(16384)
@@ -147,54 +162,49 @@ async def relay(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
             pass
 
 
-async def handle_connect(
-    reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
-    dest_addr: str,
-    dest_port: int
-):
-    """Connect to destination and establish bidirectional tunnel."""
+async def handle_connect(reader, writer, dest_addr, dest_port):
+    global active_connections
+
     try:
         remote_reader, remote_writer = await asyncio.wait_for(
             asyncio.open_connection(dest_addr, dest_port),
             timeout=CONNECT_TIMEOUT
         )
     except asyncio.TimeoutError:
-        logger.error(f"Timeout connecting to {dest_addr}:{dest_port}")
+        logger.error(f"Timeout → {dest_addr}:{dest_port}")
         reply = b"\x05\x06\x00\x01" + socket.inet_aton("0.0.0.0") + struct.pack("!H", 0)
         writer.write(reply)
         await writer.drain()
         return
     except OSError as e:
-        logger.error(f"Cannot connect to {dest_addr}:{dest_port} — {e}")
+        logger.error(f"Cannot connect → {dest_addr}:{dest_port} — {e}")
         reply = b"\x05\x05\x00\x01" + socket.inet_aton("0.0.0.0") + struct.pack("!H", 0)
         writer.write(reply)
         await writer.drain()
         return
 
-    # Send success reply with bound address
     bind_addr = remote_writer.get_extra_info("sockname")
     try:
         bind_ip = socket.inet_aton(bind_addr[0])
         reply = b"\x05\x00\x00\x01" + bind_ip + struct.pack("!H", bind_addr[1])
     except OSError:
-        # IPv6 fallback
         bind_ip = socket.inet_pton(socket.AF_INET6, bind_addr[0])
         reply = b"\x05\x00\x00\x04" + bind_ip + struct.pack("!H", bind_addr[1])
 
     writer.write(reply)
     await writer.drain()
 
-    logger.info(f"Tunnel → {dest_addr}:{dest_port}")
+    active_connections += 1
+    logger.info(f"Tunnel → {dest_addr}:{dest_port} (active: {active_connections})")
 
-    # Bidirectional relay
     await asyncio.gather(
         relay(reader, remote_writer),
         relay(remote_reader, writer),
         return_exceptions=True
     )
 
-    # Cleanup
+    active_connections -= 1
+
     for w in (writer, remote_writer):
         try:
             w.close()
@@ -204,70 +214,61 @@ async def handle_connect(
 
 
 # ============================================================
-#  Client Handler
+#  SOCKS5 Client Handler
 # ============================================================
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    """Main handler for each incoming SOCKS5 connection."""
+    global active_connections
     peer = writer.get_extra_info("peername")
     client_ip = peer[0] if peer else "unknown"
 
-    # --- Rate Limit Check ---
     if not check_rate_limit(client_ip):
         logger.warning(f"Rate limited: {client_ip}")
         writer.close()
         return
 
     try:
-        # --- Authentication ---
         if not await authenticate(reader, writer):
             writer.close()
             return
 
-        logger.info(f"Authenticated connection from {client_ip}")
+        logger.info(f"Authenticated from {client_ip}")
 
-        # --- Read CONNECT Request ---
         request_header = await asyncio.wait_for(reader.readexactly(4), timeout=10)
         ver, cmd, _, atyp = request_header
 
-        # Only CONNECT (0x01) is supported
         if ver != 0x05 or cmd != 0x01:
-            # Reply: Command not supported
             writer.write(b"\x05\x07\x00\x01" + b"\x00" * 6)
             await writer.drain()
             writer.close()
             return
 
-        # --- Parse Destination Address ---
-        if atyp == 0x01:  # IPv4
+        if atyp == 0x01:
             raw_addr = await asyncio.wait_for(reader.readexactly(4), timeout=10)
             dest_addr = socket.inet_ntoa(raw_addr)
-        elif atyp == 0x03:  # Domain Name
+        elif atyp == 0x03:
             addr_len = (await asyncio.wait_for(reader.readexactly(1), timeout=10))[0]
             dest_addr = (await asyncio.wait_for(reader.readexactly(addr_len), timeout=10)).decode("utf-8")
-        elif atyp == 0x04:  # IPv6
+        elif atyp == 0x04:
             raw_addr = await asyncio.wait_for(reader.readexactly(16), timeout=10)
             dest_addr = socket.inet_ntop(socket.AF_INET6, raw_addr)
         else:
-            # Address type not supported
             writer.write(b"\x05\x08\x00\x01" + b"\x00" * 6)
             await writer.drain()
             writer.close()
             return
 
-        # --- Parse Destination Port ---
         dest_port = struct.unpack(
             "!H",
             await asyncio.wait_for(reader.readexactly(2), timeout=10)
         )[0]
 
-        # --- Establish Tunnel ---
         await handle_connect(reader, writer, dest_addr, dest_port)
 
     except (asyncio.IncompleteReadError, asyncio.TimeoutError,
             ConnectionResetError, BrokenPipeError, OSError):
         pass
     except Exception as e:
-        logger.error(f"Unexpected error for {client_ip}: {e}", exc_info=False)
+        logger.error(f"Error for {client_ip}: {e}", exc_info=False)
     finally:
         try:
             writer.close()
@@ -277,42 +278,47 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 
 # ============================================================
-#  Main Entry Point
+#  Main — Run Both Servers Together
 # ============================================================
 async def main():
-    # Validate configuration
     if not SOCKS_USER or not SOCKS_PASS:
-        logger.critical("SOCKS_USER and SOCKS_PASS environment variables MUST be set!")
+        logger.critical("SOCKS_USER and SOCKS_PASS MUST be set!")
         raise SystemExit(1)
 
     if len(SOCKS_PASS) < 16:
-        logger.critical("SOCKS_PASS must be at least 16 characters long!")
+        logger.critical("SOCKS_PASS must be at least 16 characters!")
         raise SystemExit(1)
 
     if SOCKS_USER == "admin" or SOCKS_PASS == "password":
-        logger.critical("Please change default credentials! This is insecure.")
+        logger.critical("Change default credentials!")
         raise SystemExit(1)
 
-    server = await asyncio.start_server(
+    # --- Start SOCKS5 Server ---
+    socks_server = await asyncio.start_server(
         handle_client,
         "0.0.0.0",
         SOCKS_PORT,
-        reuse_address=True,
-        reuse_port=True
+        reuse_address=True
     )
-
-    addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets)
-    logger.info(f"SOCKS5 Auth Server listening on {addrs}")
+    logger.info(f"SOCKS5 listening on 0.0.0.0:{SOCKS_PORT}")
     logger.info(f"Username: {SOCKS_USER}")
-    logger.info(f"Rate limit: {RATE_LIMIT_MAX} connections / {RATE_LIMIT_WINDOW}s per IP")
-    logger.info(f"Connect timeout: {CONNECT_TIMEOUT}s")
+    logger.info(f"Rate limit: {RATE_LIMIT_MAX}/{RATE_LIMIT_WINDOW}s per IP")
 
-    async with server:
-        await server.serve_forever()
+    # --- Start HTTP Health Check ---
+    health_app = create_health_app()
+    runner = web.AppRunner(health_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", HEALTH_PORT)
+    await site.start()
+    logger.info(f"Health check listening on 0.0.0.0:{HEALTH_PORT}")
+
+    # --- Keep Running ---
+    logger.info("Both servers running. Ready to accept connections.")
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Server stopped by user.")
+        logger.info("Server stopped.")
